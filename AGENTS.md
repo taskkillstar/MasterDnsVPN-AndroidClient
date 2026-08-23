@@ -38,6 +38,40 @@ There is currently **no Android lint task**, **no `ktlint`/`detekt`** plugin, an
 Kotlin unit-test or instrumented-test suite**. Plans that need verification on
 the Kotlin side must add the scaffolding first (see `plans/005-kotlin-test-baseline.md`).
 
+## Upstream core sync
+
+The Go core under `cmd/`/`internal/` is a **vendored source snapshot** of the
+MasterDnsVPN desktop repo, not a module dependency. It is synced from the
+`gorepo` remote (https://github.com/taskkillstar/MasterDnsVPN):
+
+```bash
+# One-time setup (already configured in this repo)
+git remote add gorepo https://github.com/taskkillstar/MasterDnsVPN.git
+
+# Sync cmd/ + internal/ from gorepo/main (or pass another ref)
+bash ./scripts/sync_core.sh
+```
+
+The script fetches `gorepo`, stages the upstream state of `internal/`/`cmd/`
+(including deletions), runs the CI Go test set, verifies `mobile/` still
+compiles against the synced core, and **aborts if the core introduces a
+dependency missing from this repo's `go.mod`** — land it as a dedicated
+`chore(go):` commit first; version drift on known modules is informational
+only. It never edits `go.mod`/`go.sum`. Both repos use module path
+`masterdnsvpn-go`, so no import rewriting is needed.
+
+Windows note: run the bash scripts with **Git for Windows'** bash, not the WSL
+shim (`C:\Windows\system32\bash.exe`). WSL uses its own git config (no
+`core.autocrlf=true`), so it sees the CRLF working tree as fully modified and
+clean-tree guards false-fail:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe" ./scripts/sync_core.sh
+```
+
+Sync commits are the only sanctioned edits to `cmd/`/`internal/`; everything
+else about those paths follows the DO NOT EDIT policy below.
+
 ## Critical invariants
 
 1. `go.mod` and `go.sum` are **immutable from the Android side**. The script
