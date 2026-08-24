@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -330,10 +331,13 @@ func (p *FakeDNSProxy) handleUDPAssociate(tcpConn net.Conn, atyp byte, targetAdd
 				// the previous iteration's reply. Build in a fresh slice.
 				dnsQuery := make([]byte, n-offset)
 				copy(dnsQuery, buf[offset:n])
-				hostname := parseDNSQuery(dnsQuery)
-				if hostname != "" {
-					fakeIP := p.dnsMap.GetFakeIP(hostname)
-					resp := buildDNSResponse(dnsQuery, fakeIP)
+				parsed, ok := parseDNSQuery(dnsQuery)
+				if ok {
+					var fakeIP string
+					if parsed.qtype == dnsTypeA {
+						fakeIP = p.dnsMap.GetFakeIP(parsed.hostname)
+					}
+					resp := buildDNSResponse(dnsQuery, parsed, fakeIP)
 					if resp != nil {
 						fullResp := make([]byte, 0, offset+len(resp))
 						fullResp = append(fullResp, buf[:offset]...)
@@ -356,64 +360,106 @@ func (p *FakeDNSProxy) handleUDPAssociate(tcpConn net.Conn, atyp byte, targetAdd
 	io.Copy(io.Discard, tcpConn)
 }
 
-func parseDNSQuery(query []byte) string {
+const (
+	dnsTypeA   = 1
+	dnsClassIN = 1
+)
+
+type dnsParsedQuery struct {
+	hostname    string
+	qtype       uint16
+	qclass      uint16
+	questionLen int // exact offset where the Question section ends (12 + len(QNAME) + 4)
+}
+
+func parseDNSQuery(query []byte) (dnsParsedQuery, bool) {
 	if len(query) < 12 {
-		return ""
+		return dnsParsedQuery{}, false
+	}
+	qdcount := binary.BigEndian.Uint16(query[4:6])
+	if qdcount == 0 {
+		return dnsParsedQuery{}, false
 	}
 	pos := 12
 	labels := []string{}
 	for pos < len(query) {
 		length := int(query[pos])
 		if length == 0 {
+			pos++ // consume terminating null byte
 			break
 		}
 		if length > 63 || pos+1+length > len(query) {
-			return ""
+			return dnsParsedQuery{}, false
 		}
 		pos++
-		label := string(query[pos : pos+length])
-		labels = append(labels, label)
+		labels = append(labels, string(query[pos:pos+length]))
 		pos += length
 	}
-	if len(labels) == 0 {
-		return ""
+	if len(labels) == 0 || pos+4 > len(query) {
+		return dnsParsedQuery{}, false
 	}
-	hostname := ""
-	for i, label := range labels {
-		if i > 0 {
-			hostname += "."
-		}
-		hostname += label
-	}
-	return hostname
+	qtype := binary.BigEndian.Uint16(query[pos : pos+2])
+	qclass := binary.BigEndian.Uint16(query[pos+2 : pos+4])
+	pos += 4
+
+	return dnsParsedQuery{
+		hostname:    strings.Join(labels, "."),
+		qtype:       qtype,
+		qclass:      qclass,
+		questionLen: pos,
+	}, true
 }
 
-func buildDNSResponse(query []byte, fakeIP string) []byte {
-	if len(query) < 12 {
+func buildDNSResponse(query []byte, parsed dnsParsedQuery, fakeIP string) []byte {
+	if len(query) < parsed.questionLen || parsed.questionLen < 12 {
 		return nil
 	}
-	response := make([]byte, len(query)+16)
-	copy(response, query)
-	flags := binary.BigEndian.Uint16(response[2:4])
-	flags |= 0x8400
-	binary.BigEndian.PutUint16(response[2:4], flags)
-	binary.BigEndian.PutUint16(response[6:8], 1)
-	pos := len(query)
-	response[pos] = 0xC0
-	response[pos+1] = 0x0C
-	pos += 2
-	binary.BigEndian.PutUint16(response[pos:pos+2], 1)
-	binary.BigEndian.PutUint16(response[pos+2:pos+4], 1)
-	pos += 4
-	binary.BigEndian.PutUint32(response[pos:pos+4], 60)
-	pos += 4
-	binary.BigEndian.PutUint16(response[pos:pos+2], 4)
-	pos += 2
-	ip := net.ParseIP(fakeIP).To4()
-	if ip == nil {
-		return nil
+
+	queryFlags := binary.BigEndian.Uint16(query[2:4])
+	// Set QR=1 (response), AA=1 (Authoritative), RA=1 (Recursion Available),
+	// preserve RD (Recursion Desired, bit 8: 0x0100), RCODE=0 (NOERROR)
+	respFlags := (queryFlags & 0x0100) | 0x8480
+
+	if parsed.qtype == dnsTypeA {
+		ip := net.ParseIP(fakeIP).To4()
+		if ip == nil {
+			return nil
+		}
+
+		// Total size = question section + 16-byte Answer RR
+		response := make([]byte, parsed.questionLen+16)
+		copy(response, query[:parsed.questionLen])
+
+		binary.BigEndian.PutUint16(response[2:4], respFlags)
+		binary.BigEndian.PutUint16(response[4:6], 1) // QDCOUNT = 1
+		binary.BigEndian.PutUint16(response[6:8], 1) // ANCOUNT = 1
+		binary.BigEndian.PutUint16(response[8:10], 0) // NSCOUNT = 0
+		binary.BigEndian.PutUint16(response[10:12], 0) // ARCOUNT = 0
+
+		p := parsed.questionLen
+		response[p] = 0xC0
+		response[p+1] = 0x0C // Compression pointer to QNAME at offset 12
+		p += 2
+		binary.BigEndian.PutUint16(response[p:p+2], dnsTypeA)
+		binary.BigEndian.PutUint16(response[p+2:p+4], dnsClassIN)
+		p += 4
+		binary.BigEndian.PutUint32(response[p:p+4], 60) // TTL = 60s
+		p += 4
+		binary.BigEndian.PutUint16(response[p:p+2], 4) // RDLENGTH = 4
+		p += 2
+		copy(response[p:p+4], ip)
+		return response
 	}
-	copy(response[pos:pos+4], ip)
-	pos += 4
-	return response[:pos]
+
+	// For non-A queries (AAAA, HTTPS, TXT, MX, etc.): return NODATA (NOERROR, ANCOUNT=0)
+	response := make([]byte, parsed.questionLen)
+	copy(response, query[:parsed.questionLen])
+
+	binary.BigEndian.PutUint16(response[2:4], respFlags)
+	binary.BigEndian.PutUint16(response[4:6], 1) // QDCOUNT = 1
+	binary.BigEndian.PutUint16(response[6:8], 0) // ANCOUNT = 0
+	binary.BigEndian.PutUint16(response[8:10], 0) // NSCOUNT = 0
+	binary.BigEndian.PutUint16(response[10:12], 0) // ARCOUNT = 0
+
+	return response
 }
