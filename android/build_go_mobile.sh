@@ -23,6 +23,15 @@ check_go_modules_clean
 go install "golang.org/x/mobile/cmd/gomobile@${MOBILE_TOOLS_VERSION}"
 go install "golang.org/x/mobile/cmd/gobind@${MOBILE_TOOLS_VERSION}"
 
+if ! command -v javac >/dev/null 2>&1 && [ -n "${JAVA_HOME:-}" ]; then
+  if command -v cygpath >/dev/null 2>&1; then
+    JH="$(cygpath -u "$JAVA_HOME")"
+  else
+    JH="$JAVA_HOME"
+  fi
+  export PATH="$JH/bin:$PATH"
+fi
+
 export PATH="$(go env GOPATH)/bin:$PATH"
 GO111MODULE=on gomobile init
 
