@@ -377,3 +377,88 @@ func TestHandleUDPResponseBuildDoesNotReuseReceiveBuffer(t *testing.T) {
 		}
 	}
 }
+
+func TestFakeDNSProxy_LiveUDPLifecycle(t *testing.T) {
+	dnsMap := NewDNSMapper()
+	proxy := NewFakeDNSProxy("127.0.0.1:18000", dnsMap)
+
+	tcpAddr, err := proxy.Start()
+	if err != nil {
+		t.Fatalf("proxy.Start() failed: %v", err)
+	}
+	defer proxy.Stop()
+
+	if proxy.udpPort == 0 {
+		t.Fatal("proxy.udpPort is 0 after Start()")
+	}
+
+	// Dial proxy UDP port
+	udpConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: proxy.udpPort})
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer udpConn.Close()
+
+	// Construct SOCKS5 UDP encapsulated DNS query for "test.example.com"
+	dnsQ := buildQuery(t, "test.example.com")
+	socksHeader := []byte{0x00, 0x00, 0x00, 0x01, 172, 19, 0, 2, 0, 53} // DST = 172.19.0.2:53
+	packet := append(socksHeader, dnsQ...)
+
+	if _, err := udpConn.Write(packet); err != nil {
+		t.Fatalf("Write to UDP failed: %v", err)
+	}
+
+	recvBuf := make([]byte, 2048)
+	n, err := udpConn.Read(recvBuf)
+	if err != nil {
+		t.Fatalf("Read from UDP failed: %v", err)
+	}
+	if n < len(socksHeader)+len(dnsQ)+16 {
+		t.Fatalf("received UDP packet too short: %d bytes", n)
+	}
+
+	// Verify Fake IP mapping was created
+	fakeIP, ok := dnsMap.hostnameToIP["test.example.com"]
+	if !ok {
+		t.Fatal("Fake IP not created in dnsMap")
+	}
+
+	// Verify SOCKS5 header in response
+	if recvBuf[0] != 0 || recvBuf[1] != 0 || recvBuf[2] != 0 || recvBuf[3] != 1 {
+		t.Fatalf("invalid SOCKS5 header in response: %v", recvBuf[:4])
+	}
+
+	// Verify DNS answer IP in payload
+	ansOffset := len(socksHeader) + len(dnsQ) + 12
+	gotIP := net.IP(recvBuf[ansOffset : ansOffset+4]).String()
+	if gotIP != fakeIP {
+		t.Fatalf("DNS response IP = %s, want %s", gotIP, fakeIP)
+	}
+
+	// Verify TCP connection
+	tcpConn, err := net.Dial("tcp", tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial TCP failed: %v", err)
+	}
+	defer tcpConn.Close()
+
+	// SOCKS5 handshake greeting
+	if _, err := tcpConn.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatalf("TCP handshake write failed: %v", err)
+	}
+	authResp := make([]byte, 2)
+	if _, err := tcpConn.Read(authResp); err != nil || authResp[0] != 5 || authResp[1] != 0 {
+		t.Fatalf("TCP auth response invalid: %v", authResp)
+	}
+
+	// SOCKS5 UDP ASSOCIATE request
+	req := []byte{5, 3, 0, 1, 172, 19, 0, 2, 0, 53}
+	if _, err := tcpConn.Write(req); err != nil {
+		t.Fatalf("UDP ASSOCIATE write failed: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := tcpConn.Read(reply); err != nil || reply[1] != 0 {
+		t.Fatalf("UDP ASSOCIATE reply invalid: %v", reply)
+	}
+}
+

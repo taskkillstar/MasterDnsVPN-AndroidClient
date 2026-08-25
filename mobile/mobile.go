@@ -113,16 +113,26 @@ func handleTracking(c net.Conn, realProxyAddr string) {
 		onWrite: func(n int64) { atomic.AddInt64(&trackedDown, n) },
 	}
 
-	errc := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
-		_, err := io.Copy(server, tcClient)
-		errc <- err
+		defer wg.Done()
+		_, _ = io.Copy(server, tcClient)
+		if tc, ok := server.(interface{ CloseWrite() error }); ok {
+			_ = tc.CloseWrite()
+		}
 	}()
+
 	go func() {
-		_, err := io.Copy(tcClient, server)
-		errc <- err
+		defer wg.Done()
+		_, _ = io.Copy(tcClient, server)
+		if tc, ok := tcClient.Conn.(interface{ CloseWrite() error }); ok {
+			_ = tc.CloseWrite()
+		}
 	}()
-	<-errc
+
+	wg.Wait()
 }
 
 // Bandwidth holds upload and download counters for gomobile bindings.

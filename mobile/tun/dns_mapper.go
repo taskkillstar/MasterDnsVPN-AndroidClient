@@ -3,6 +3,7 @@ package tun
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -26,7 +27,9 @@ func (d *DNSMapper) GetFakeIP(hostname string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if ip, ok := d.hostnameToIP[hostname]; ok {
+	normalized := strings.ToLower(strings.TrimSuffix(hostname, "."))
+
+	if ip, ok := d.hostnameToIP[normalized]; ok {
 		return ip
 	}
 
@@ -40,10 +43,10 @@ func (d *DNSMapper) GetFakeIP(hostname string) string {
 	octet4 := byte(counter & 0xFF)
 	fakeIP := fmt.Sprintf("198.18.%d.%d", octet3, octet4)
 
-	d.hostnameToIP[hostname] = fakeIP
-	d.ipToHostname[fakeIP] = hostname
+	d.hostnameToIP[normalized] = fakeIP
+	d.ipToHostname[fakeIP] = normalized
 
-	log.Printf("[TUN-DNS] Mapped %s -> %s", hostname, fakeIP)
+	log.Printf("[TUN-DNS] Mapped %s -> %s", normalized, fakeIP)
 	return fakeIP
 }
 
