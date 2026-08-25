@@ -12,6 +12,8 @@ import (
 type FakeDNSProxy struct {
 	RealSocksAddr string
 	LocalPort     int
+	udpPort       int
+	udpConn       *net.UDPConn
 	dnsMap        *DNSMapper
 	listener      net.Listener
 	ctx           context.Context
@@ -30,6 +32,7 @@ func NewFakeDNSProxy(realSocksAddr string, dnsMap *DNSMapper) *FakeDNSProxy {
 }
 
 func (p *FakeDNSProxy) Start() (string, error) {
+	// 1. TCP Listener for SOCKS5 requests
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", err
@@ -37,8 +40,18 @@ func (p *FakeDNSProxy) Start() (string, error) {
 	p.listener = l
 	p.LocalPort = l.Addr().(*net.TCPAddr).Port
 
-	p.wg.Add(1)
+	// 2. Persistent UDP Listener for FakeDNS datagrams
+	u, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		p.listener.Close()
+		return "", err
+	}
+	p.udpConn = u
+	p.udpPort = u.LocalAddr().(*net.UDPAddr).Port
+
+	p.wg.Add(2)
 	go p.acceptLoop()
+	go p.udpLoop()
 
 	return l.Addr().String(), nil
 }
@@ -48,6 +61,10 @@ func (p *FakeDNSProxy) Stop() {
 	if p.listener != nil {
 		p.listener.Close()
 	}
+	if p.udpConn != nil {
+		p.udpConn.Close()
+	}
+	p.wg.Wait()
 }
 
 func (p *FakeDNSProxy) acceptLoop() {
@@ -65,6 +82,73 @@ func (p *FakeDNSProxy) acceptLoop() {
 			defer p.wg.Done()
 			p.handleConnection(c)
 		}(conn)
+	}
+}
+
+func (p *FakeDNSProxy) udpLoop() {
+	defer p.wg.Done()
+	buf := make([]byte, 65535)
+	for {
+		n, rAddr, err := p.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if p.ctx.Err() != nil {
+				return
+			}
+			return
+		}
+
+		if n < 4 || buf[2] != 0 {
+			continue
+		}
+
+		atyp := buf[3]
+		var offset int
+		var tPort uint16
+
+		if atyp == 1 {
+			offset = 10
+			if n < offset {
+				continue
+			}
+			tPort = binary.BigEndian.Uint16(buf[8:10])
+		} else if atyp == 3 {
+			l := int(buf[4])
+			offset = 5 + l + 2
+			if n < offset {
+				continue
+			}
+			tPort = binary.BigEndian.Uint16(buf[5+l : offset])
+		} else if atyp == 4 {
+			offset = 22
+			if n < offset {
+				continue
+			}
+			tPort = binary.BigEndian.Uint16(buf[20:22])
+		} else {
+			continue
+		}
+
+		if tPort == 53 {
+			dnsQuery := make([]byte, n-offset)
+			copy(dnsQuery, buf[offset:n])
+			parsed, ok := parseDNSQuery(dnsQuery)
+			if ok {
+				var fakeIP string
+				if parsed.qtype == dnsTypeA {
+					fakeIP = p.dnsMap.GetFakeIP(parsed.hostname)
+				}
+				resp := buildDNSResponse(dnsQuery, parsed, fakeIP)
+				if resp != nil {
+					fullResp := make([]byte, 0, offset+len(resp))
+					fullResp = append(fullResp, buf[:offset]...)
+					fullResp = append(fullResp, resp...)
+					p.udpConn.WriteToUDP(fullResp, rAddr)
+				}
+			}
+			continue
+		}
+
+		// Non-DNS UDP (e.g. QUIC) is dropped so browser quickly falls back to TCP
 	}
 }
 
@@ -136,7 +220,7 @@ func (p *FakeDNSProxy) handleConnection(conn net.Conn) {
 	}
 
 	if cmd == 3 { // UDP ASSOCIATE
-		p.handleUDPAssociate(conn, atyp, targetAddr, targetPort)
+		p.handleUDPAssociate(conn)
 		return
 	}
 
@@ -174,190 +258,61 @@ func (p *FakeDNSProxy) handleConnection(conn net.Conn) {
 	var bndAddr []byte
 	if replyHeader[3] == 1 {
 		bndAddr = make([]byte, 4)
+		if _, err := io.ReadFull(realConn, bndAddr); err != nil {
+			return
+		}
 	} else if replyHeader[3] == 3 {
 		l := make([]byte, 1)
-		io.ReadFull(realConn, l)
-		bndAddr = make([]byte, l[0])
-		bndAddr = append(l, bndAddr...)
+		if _, err := io.ReadFull(realConn, l); err != nil {
+			return
+		}
+		dom := make([]byte, l[0])
+		if _, err := io.ReadFull(realConn, dom); err != nil {
+			return
+		}
+		bndAddr = append(l, dom...)
 	} else if replyHeader[3] == 4 {
 		bndAddr = make([]byte, 16)
+		if _, err := io.ReadFull(realConn, bndAddr); err != nil {
+			return
+		}
 	}
 	if len(bndAddr) > 0 {
-		io.ReadFull(realConn, bndAddr)
-		conn.Write(bndAddr)
+		if _, err := conn.Write(bndAddr); err != nil {
+			return
+		}
 	}
 
 	bndPort := make([]byte, 2)
-	io.ReadFull(realConn, bndPort)
-	conn.Write(bndPort)
+	if _, err := io.ReadFull(realConn, bndPort); err != nil {
+		return
+	}
+	if _, err := conn.Write(bndPort); err != nil {
+		return
+	}
 
 	go io.Copy(realConn, conn)
 	io.Copy(conn, realConn)
 }
 
-func (p *FakeDNSProxy) handleUDPAssociate(tcpConn net.Conn, atyp byte, targetAddr []byte, targetPort []byte) {
-	realConn, err := net.Dial("tcp", p.RealSocksAddr)
-	if err != nil {
-		tcpConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer realConn.Close()
-
-	if _, err := realConn.Write([]byte{5, 1, 0}); err != nil {
-		return
-	}
-	authResp := make([]byte, 2)
-	if _, err := io.ReadFull(realConn, authResp); err != nil {
-		return
-	}
-
-	req := []byte{5, 3, 0, atyp}
-	req = append(req, targetAddr...)
-	req = append(req, targetPort...)
-	if _, err := realConn.Write(req); err != nil {
-		return
-	}
-
-	replyHeader := make([]byte, 4)
-	if _, err := io.ReadFull(realConn, replyHeader); err != nil {
-		return
-	}
-
-	var bndAddr []byte
-	if replyHeader[3] == 1 {
-		bndAddr = make([]byte, 4)
-	} else if replyHeader[3] == 3 {
-		l := make([]byte, 1)
-		io.ReadFull(realConn, l)
-		dom := make([]byte, l[0])
-		io.ReadFull(realConn, dom)
-		bndAddr = append(l, dom...)
-	} else if replyHeader[3] == 4 {
-		bndAddr = make([]byte, 16)
-	}
-	if len(bndAddr) > 0 {
-		io.ReadFull(realConn, bndAddr)
-	}
-
-	bndPortBuf := make([]byte, 2)
-	io.ReadFull(realConn, bndPortBuf)
-
-	var realUdpAddr *net.UDPAddr
-	if replyHeader[3] == 1 {
-		realUdpAddr = &net.UDPAddr{IP: net.IP(bndAddr), Port: int(binary.BigEndian.Uint16(bndPortBuf))}
-	} else if replyHeader[3] == 4 {
-		realUdpAddr = &net.UDPAddr{IP: net.IP(bndAddr), Port: int(binary.BigEndian.Uint16(bndPortBuf))}
-	}
-	if realUdpAddr != nil && realUdpAddr.IP.IsUnspecified() {
-		host, _, _ := net.SplitHostPort(p.RealSocksAddr)
-		realUdpAddr.IP = net.ParseIP(host)
-	}
-
-	localUdp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		tcpConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer localUdp.Close()
-
-	localPort := localUdp.LocalAddr().(*net.UDPAddr).Port
-
+func (p *FakeDNSProxy) handleUDPAssociate(tcpConn net.Conn) {
+	// SOCKS5 UDP ASSOCIATE reply: BND.ADDR = 127.0.0.1, BND.PORT = p.udpPort
 	reply := []byte{5, 0, 0, 1, 127, 0, 0, 1}
 	pBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(pBuf, uint16(localPort))
+	binary.BigEndian.PutUint16(pBuf, uint16(p.udpPort))
 	reply = append(reply, pBuf...)
 	if _, err := tcpConn.Write(reply); err != nil {
 		return
 	}
 
-	go func() {
-		buf := make([]byte, 65535)
-		var tun2socksAddr *net.UDPAddr
-		for {
-			n, rAddr, err := localUdp.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-
-			if realUdpAddr != nil && rAddr.IP.Equal(realUdpAddr.IP) && rAddr.Port == realUdpAddr.Port {
-				if tun2socksAddr != nil {
-					localUdp.WriteToUDP(buf[:n], tun2socksAddr)
-				}
-				continue
-			}
-
-			tun2socksAddr = rAddr
-
-			if n < 4 || buf[2] != 0 {
-				continue
-			}
-			frag := buf[2]
-			if frag != 0 {
-				continue
-			}
-
-			atyp := buf[3]
-			var offset int
-			var tPort uint16
-
-			if atyp == 1 {
-				offset = 10
-				if n < offset {
-					continue
-				}
-				tPort = binary.BigEndian.Uint16(buf[8:10])
-			} else if atyp == 3 {
-				l := int(buf[4])
-				offset = 5 + l + 2
-				if n < offset {
-					continue
-				}
-				tPort = binary.BigEndian.Uint16(buf[5+l : offset])
-			} else if atyp == 4 {
-				offset = 22
-				if n < offset {
-					continue
-				}
-				tPort = binary.BigEndian.Uint16(buf[20:22])
-			} else {
-				continue
-			}
-
-			if tPort == 53 {
-				// Plan 015: previously `append(buf[:offset], resp...)` reused
-				// the receive buffer's backing array. On the next ReadFromUDP,
-				// only `n` bytes overwrite buf, leaving stale response bytes
-				// past `n` — parseDNSQuery then read corrupted offsets from
-				// the previous iteration's reply. Build in a fresh slice.
-				dnsQuery := make([]byte, n-offset)
-				copy(dnsQuery, buf[offset:n])
-				parsed, ok := parseDNSQuery(dnsQuery)
-				if ok {
-					var fakeIP string
-					if parsed.qtype == dnsTypeA {
-						fakeIP = p.dnsMap.GetFakeIP(parsed.hostname)
-					}
-					resp := buildDNSResponse(dnsQuery, parsed, fakeIP)
-					if resp != nil {
-						fullResp := make([]byte, 0, offset+len(resp))
-						fullResp = append(fullResp, buf[:offset]...)
-						fullResp = append(fullResp, resp...)
-						localUdp.WriteToUDP(fullResp, rAddr)
-					}
-				}
-				continue
-			}
-
-			// ponytail: non-DNS UDP (QUIC, etc.) dropped, not forwarded.
-			// Upstream SOCKS5 UDP_ASSOCIATE rejects non-53 targets
-			// (socks_manager.go:665), forwarding would close the association
-			// and break subsequent DNS queries. Dropping lets the browser's
-			// QUIC probe time out fast and fall back to TCP (issue #32).
+	// Keep the TCP connection open until the client disconnects, as required by SOCKS5 spec.
+	buf := make([]byte, 512)
+	for {
+		_, err := tcpConn.Read(buf)
+		if err != nil {
+			return
 		}
-	}()
-
-	// Keep TCP connection open
-	io.Copy(io.Discard, tcpConn)
+	}
 }
 
 const (

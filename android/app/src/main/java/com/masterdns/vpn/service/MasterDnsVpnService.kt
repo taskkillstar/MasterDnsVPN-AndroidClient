@@ -396,6 +396,17 @@ class MasterDnsVpnService : VpnService() {
             VpnManager.appendLog("Added fake DNS route: 198.18.0.0/16")
         }
 
+        // Route IPv6 into VPN so apps don't leak or hang on IPv6 DNS / connections
+        runCatching {
+            builder.addAddress("fd00::1", 128)
+            builder.addRoute("::", 0)
+            if (inputs.globalSettings.fakeDnsEnabled) {
+                builder.addDnsServer("fd00::2")
+            }
+        }.onFailure { e ->
+            VpnManager.appendLog("IPv6 VPN route setup: ${e.message}")
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             val splitEnabled = inputs.globalSettings.splitTunnelingEnabled &&
                 inputs.globalSettings.splitPackagesCsv.isNotBlank()

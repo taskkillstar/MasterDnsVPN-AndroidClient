@@ -29,6 +29,22 @@ func TestDNSMapper_GetFakeIP_StableForSameHostname(t *testing.T) {
 	}
 }
 
+func TestDNSMapper_GetFakeIP_CaseInsensitiveAndDotNormalization(t *testing.T) {
+	d := NewDNSMapper()
+
+	first := d.GetFakeIP("WwW.GoOgLe.CoM")
+	second := d.GetFakeIP("www.google.com.")
+	third := d.GetFakeIP("WWW.GOOGLE.COM")
+	if first != second || second != third {
+		t.Fatalf("case-randomized hostnames mapped differently: %q vs %q vs %q", first, second, third)
+	}
+
+	host, ok := d.GetHostname(first)
+	if !ok || host != "www.google.com" {
+		t.Fatalf("GetHostname(%q) = %q (ok=%v), want www.google.com", first, host, ok)
+	}
+}
+
 func TestDNSMapper_GetHostname_RoundTrips(t *testing.T) {
 	d := NewDNSMapper()
 
